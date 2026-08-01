@@ -84,6 +84,11 @@ export function useTireSelector() {
      */
     isUnverified: data?.verified === false,
     approvedSizes: data?.approvedSizes ?? [],
+    /**
+     * TPMS fact plus a class-typical inflation range. Null on payloads from a
+     * build that predates it, so the panel simply does not render.
+     */
+    tirePressure: data?.tirePressure ?? null,
     unavailableSizes: data?.unavailableSizes ?? [],
     tires: data?.items ?? [],
     isStaggered,

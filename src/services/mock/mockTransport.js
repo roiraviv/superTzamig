@@ -447,6 +447,8 @@ const routes = [
         vehicle: specs.vehicle,
         /** Drives the "not confirmed against the registry" notice in the UI. */
         verified: specs.verified !== false,
+        /** Vehicle-level, so it rides alongside the grid rather than in it. */
+        tirePressure: specs.tirePressure ?? null,
         source: specs.source,
         approvedSizes: approved,
         /** Approved sizes we stock nothing for — shown so the offer stays honest. */

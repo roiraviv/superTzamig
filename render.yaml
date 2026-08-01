@@ -1,0 +1,49 @@
+# Render blueprint — one web service serving both the React build and the API.
+#
+# Split hosting (Static Site + Web Service) is the tempting shape here and it
+# does not work: Vite's dev proxy has no production equivalent, so the built
+# bundle's relative `/api` calls would hit the static host and 404. One origin
+# also means no CORS and no cross-site cookie.
+services:
+  - type: web
+    name: supertzamig
+    runtime: node
+    plan: free
+    region: frankfurt # Closest to both the customers and data.gov.il.
+
+    # Vite is a devDependency, so the build needs the full install.
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+
+    # Reports process liveness only, never the registry's — see server/index.js.
+    healthCheckPath: /api/health
+
+    envVars:
+      - key: NODE_VERSION
+        value: 22.11.0
+
+      # `npm ci` skips devDependencies when this is production, and Vite would
+      # not be installed for the build step.
+      - key: NODE_ENV
+        value: development
+
+      - key: SERVE_STATIC
+        value: 'true'
+
+      # One proxy hop in front of us. See config.trustProxy — `true` would let a
+      # client forge X-Forwarded-For and reset its own rate limit.
+      - key: TRUST_PROXY
+        value: '1'
+
+      # Gates /api/diagnostics/registry, which exposes internal CKAN resource
+      # ids. Generated per-deploy; read it from the Render dashboard and send it
+      # as the X-Diagnostics-Token header.
+      - key: DIAGNOSTICS_TOKEN
+        generateValue: true
+
+      # The persistent fitment cache needs `mongoose`, which is not a dependency
+      # of this service yet. Leave off until it is installed and MONGO_URI is
+      # set, or the service degrades to extra upstream calls rather than an
+      # outage — but see the note in config.js before flipping it.
+      - key: ENABLE_MONGO_CACHE
+        value: 'false'

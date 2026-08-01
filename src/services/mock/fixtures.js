@@ -401,6 +401,37 @@ export const vehicleRegistry = {
  * `55555555` has approved sizes we carry nothing for, which is what exercises
  * the empty state.
  */
+/**
+ * Mirrors `server/lib/tirePressure.js`.
+ *
+ * The Ministry of Transport publishes tire sizes and a TPMS flag and no
+ * inflation pressure at all, so a fixture must not invent one either — these
+ * are the same class-typical ranges the real backend returns, not per-vehicle
+ * figures. `equipped` is the one genuine per-model fact in here.
+ */
+const pressureFor = (vehicleClass, equipped) => {
+  const ranges = {
+    passenger: [2.0, 2.5],
+    suv: [2.2, 2.8],
+    commercial: [2.5, 3.5],
+    performance: [2.2, 2.9],
+  }
+  const [barMin, barMax] = ranges[vehicleClass] ?? ranges.passenger
+
+  return {
+    tpms: { equipped, source: 'ministry_of_transport' },
+    guidance: {
+      barMin,
+      barMax,
+      psiMin: Math.round(barMin * 14.5038),
+      psiMax: Math.round(barMax * 14.5038),
+      vehicleClass,
+      vehicleSpecific: false,
+      source: 'general_guidance',
+    },
+  }
+}
+
 export const vehicleTireSpecs = {
   8842123: {
     _id: '65f3a0000000000000000801',
@@ -414,6 +445,7 @@ export const vehicleTireSpecs = {
       vehicleClass: 'performance',
       curbWeightKg: 1515,
     },
+    tirePressure: pressureFor('performance', true),
     approvedSizes: [
       {
         position: 'front',
@@ -421,7 +453,6 @@ export const vehicleTireSpecs = {
         loadIndex: 98,
         speedRating: 'Y',
         isOem: true,
-        recommendedPressureBar: 2.2,
       },
       {
         position: 'rear',
@@ -429,7 +460,6 @@ export const vehicleTireSpecs = {
         loadIndex: 96,
         speedRating: 'Y',
         isOem: true,
-        recommendedPressureBar: 2.5,
       },
     ],
   },
@@ -445,6 +475,7 @@ export const vehicleTireSpecs = {
       vehicleClass: 'passenger',
       curbWeightKg: 1395,
     },
+    tirePressure: pressureFor('passenger', true),
     approvedSizes: [
       {
         position: 'all',
@@ -452,7 +483,6 @@ export const vehicleTireSpecs = {
         loadIndex: 91,
         speedRating: 'V',
         isOem: true,
-        recommendedPressureBar: 2.3,
       },
       // Approved but not stocked — proves the grid filters by what we can fit today.
       {
@@ -461,7 +491,6 @@ export const vehicleTireSpecs = {
         loadIndex: 94,
         speedRating: 'W',
         isOem: false,
-        recommendedPressureBar: 2.4,
       },
     ],
   },
@@ -477,6 +506,7 @@ export const vehicleTireSpecs = {
       vehicleClass: 'suv',
       curbWeightKg: 1690,
     },
+    tirePressure: pressureFor('suv', true),
     approvedSizes: [
       {
         position: 'all',
@@ -484,7 +514,6 @@ export const vehicleTireSpecs = {
         loadIndex: 96,
         speedRating: 'H',
         isOem: true,
-        recommendedPressureBar: 2.4,
       },
       {
         position: 'all',
@@ -492,7 +521,6 @@ export const vehicleTireSpecs = {
         loadIndex: 101,
         speedRating: 'V',
         isOem: false,
-        recommendedPressureBar: 2.5,
       },
     ],
   },
@@ -508,6 +536,8 @@ export const vehicleTireSpecs = {
       vehicleClass: 'passenger',
       curbWeightKg: 1320,
     },
+    /** `null` keeps the "we don't know" path reachable — the badge is omitted. */
+    tirePressure: pressureFor('passenger', null),
     approvedSizes: [
       {
         position: 'all',
@@ -515,7 +545,6 @@ export const vehicleTireSpecs = {
         loadIndex: 91,
         speedRating: 'V',
         isOem: true,
-        recommendedPressureBar: 2.2,
       },
       {
         position: 'all',
@@ -523,7 +552,6 @@ export const vehicleTireSpecs = {
         loadIndex: 94,
         speedRating: 'V',
         isOem: false,
-        recommendedPressureBar: 2.3,
       },
       {
         position: 'all',
@@ -531,7 +559,6 @@ export const vehicleTireSpecs = {
         loadIndex: 95,
         speedRating: 'W',
         isOem: false,
-        recommendedPressureBar: 2.4,
       },
     ],
   },
@@ -547,6 +574,8 @@ export const vehicleTireSpecs = {
       vehicleClass: 'commercial',
       curbWeightKg: 2050,
     },
+    /** Light commercials were outside the TPMS mandate, so this state is real. */
+    tirePressure: pressureFor('commercial', false),
     approvedSizes: [
       {
         position: 'all',
@@ -554,7 +583,6 @@ export const vehicleTireSpecs = {
         loadIndex: 107,
         speedRating: 'R',
         isOem: true,
-        recommendedPressureBar: 3.5,
       },
     ],
   },
@@ -570,6 +598,7 @@ export const vehicleTireSpecs = {
       vehicleClass: 'passenger',
       curbWeightKg: 1830,
     },
+    tirePressure: pressureFor('passenger', true),
     approvedSizes: [
       {
         position: 'all',
@@ -577,7 +606,6 @@ export const vehicleTireSpecs = {
         loadIndex: 98,
         speedRating: 'Y',
         isOem: true,
-        recommendedPressureBar: 2.9,
       },
     ],
   },

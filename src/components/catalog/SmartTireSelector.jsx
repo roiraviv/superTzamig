@@ -13,6 +13,7 @@ import { EmptyState, ErrorState, Skeleton } from '../ui/StateViews'
 import { MicroTrustBadge } from '../trust/TrustBadges'
 import { LicensePlateInput } from './LicensePlateInput'
 import { TireCard } from './TireCard'
+import { TirePressureCard } from './TirePressureCard'
 
 const ALIGNMENT_SERVICE = SERVICE_TYPES.find((service) => service.id === 'alignment')
 
@@ -391,6 +392,13 @@ export function SmartTireSelector() {
           />
 
           {selector.isUnverified && <UnverifiedSourceNotice />}
+
+          {/*
+            Sits with the vehicle, not with the tires. Pressure is set by the
+            car and its load, so it belongs next to "this is your car" rather
+            than repeated down a grid of interchangeable products.
+          */}
+          <TirePressureCard tirePressure={selector.tirePressure} />
 
           {selector.isStaggered && (
             <AxleFilter value={selector.position} onChange={selector.setPosition} />
