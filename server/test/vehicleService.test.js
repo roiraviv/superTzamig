@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { config } from '../config.js'
 import { mergeApprovedSizes, parseTireSizes, toApprovedSizes } from '../lib/tireSize.js'
+import { barToPsi, buildTirePressure, readTpms } from '../lib/tirePressure.js'
 import { __resetBreaker } from '../lib/govApiClient.js'
 import { fallbackFitmentForVehicle, shouldFallBack } from '../services/fallbackService.js'
 import {
@@ -307,6 +309,65 @@ describe('fallbackService', () => {
   })
 })
 
+describe('tirePressure', () => {
+  it('converts bar to psi', () => {
+    assert.equal(barToPsi(2.0), 29)
+    assert.equal(barToPsi(2.5), 36)
+    assert.equal(barToPsi(3.5), 51)
+  })
+
+  it('reads the TPMS flag from the model rows', () => {
+    assert.equal(readTpms([{ hayshaney_lahatz_avir_batzmigim_ind: 1 }]), true)
+    assert.equal(readTpms([{ hayshaney_lahatz_avir_batzmigim_ind: '1' }]), true)
+    assert.equal(readTpms([{ hayshaney_lahatz_avir_batzmigim_ind: 0 }]), false)
+  })
+
+  it('reports unknown rather than guessing when trims disagree', () => {
+    const rows = [
+      { hayshaney_lahatz_avir_batzmigim_ind: 1 },
+      { hayshaney_lahatz_avir_batzmigim_ind: 0 },
+    ]
+    assert.equal(readTpms(rows), null, 'a split verdict is not a verdict')
+  })
+
+  it('reports unknown when the field is absent or empty', () => {
+    assert.equal(readTpms([]), null)
+    assert.equal(readTpms([{}]), null)
+    assert.equal(readTpms([{ hayshaney_lahatz_avir_batzmigim_ind: '' }]), null)
+  })
+
+  it('scales the guidance range to the vehicle class', () => {
+    const car = buildTirePressure({ vehicleClass: 'passenger' })
+    const van = buildTirePressure({ vehicleClass: 'commercial' })
+
+    assert.equal(car.guidance.barMax, 2.5)
+    assert.equal(van.guidance.barMin, 2.5)
+    assert.ok(van.guidance.psiMax > car.guidance.psiMax)
+  })
+
+  it('falls back to the passenger range for an unknown class', () => {
+    const unknown = buildTirePressure({ vehicleClass: 'hovercraft' })
+    assert.equal(unknown.guidance.barMin, 2.0)
+    assert.equal(unknown.guidance.barMax, 2.5)
+  })
+
+  /**
+   * The load-bearing assertion in this file. The registry publishes no
+   * recommended pressure, so nothing here may ever present itself as one.
+   */
+  it('never claims the range is specific to the vehicle', () => {
+    for (const vehicleClass of ['passenger', 'suv', 'commercial', 'performance']) {
+      const built = buildTirePressure({ vehicleClass })
+      assert.equal(built.guidance.vehicleSpecific, false)
+      assert.equal(built.guidance.source, 'general_guidance')
+      assert.ok(
+        built.guidance.barMin < built.guidance.barMax,
+        'guidance must stay a range, never collapse to a single figure',
+      )
+    }
+  })
+})
+
 describe('getVehicleTireSpecs (aggregation over a stubbed registry)', () => {
   const realFetch = globalThis.fetch
   let calls = []
@@ -328,17 +389,22 @@ describe('getVehicleTireSpecs (aggregation over a stubbed registry)', () => {
   const VEHICLES = '053cea08-09bc-40ec-8f7a-156f0677aff3'
   const MODELS = '142afde2-6228-49f9-8a29-9b6c3a0cbe40'
 
+  const realEnrich = config.gov.enrichModelData
+
   beforeEach(() => {
     calls = []
     __clearCaches()
     __resetBreaker()
+    config.gov.enrichModelData = realEnrich
   })
 
   afterEach(() => {
     globalThis.fetch = realFetch
+    config.gov.enrichModelData = realEnrich
   })
 
-  it('skips the model lookup when the vehicle row already has sizes', async () => {
+  it('skips the model lookup entirely when the vehicle row has sizes and enrichment is off', async () => {
+    config.gov.enrichModelData = false
     stubRegistry({
       [VEHICLES]: [
         {
@@ -357,6 +423,98 @@ describe('getVehicleTireSpecs (aggregation over a stubbed registry)', () => {
     assert.equal(calls.length, 1, 'should not call the models dataset')
     assert.equal(specs.vehicle.model, 'MAZDA 3')
     assert.deepEqual(specs.approvedSizes.map((entry) => entry.size), ['205/60R16'])
+  })
+
+  it('reads the TPMS flag by enrichment without letting it change the sizes', async () => {
+    stubRegistry({
+      [VEHICLES]: [
+        {
+          mispar_rechev: 1234567,
+          tozeret_cd: 297,
+          degem_cd: 415,
+          tozeret_nm: 'מאזדה יפן',
+          kinuy_mishari: 'MAZDA 3',
+          shnat_yitzur: 2020,
+          zmig_kidmi: '205/60R16',
+          zmig_ahori: '205/60R16',
+        },
+      ],
+      // A size the vehicle row does not list. It must not reach the payload:
+      // enrichment answers "does it have TPMS", never "what fits".
+      [MODELS]: [
+        { shnat_yitzur: 2020, zmig_kidmi: '225/45R18', hayshaney_lahatz_avir_batzmigim_ind: 1 },
+      ],
+    })
+
+    const specs = await getVehicleTireSpecs('1234567')
+
+    assert.equal(calls.length, 2, 'enrichment costs the second call')
+    assert.deepEqual(
+      specs.approvedSizes.map((entry) => entry.size),
+      ['205/60R16'],
+      'the enrichment row must not contribute an approved size',
+    )
+    assert.equal(specs.tirePressure.tpms.equipped, true)
+    assert.equal(specs.tirePressure.guidance.vehicleSpecific, false)
+  })
+
+  it('answers normally when the enrichment call fails', async () => {
+    globalThis.fetch = async (url) => {
+      const resourceId = new URL(url).searchParams.get('resource_id')
+      calls.push({ resourceId })
+
+      if (resourceId === MODELS) throw new Error('models dataset unreachable')
+
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          success: true,
+          result: {
+            records: [
+              {
+                mispar_rechev: 1234567,
+                tozeret_cd: 297,
+                degem_cd: 415,
+                tozeret_nm: 'מאזדה יפן',
+                kinuy_mishari: 'MAZDA 3',
+                shnat_yitzur: 2020,
+                zmig_kidmi: '205/60R16',
+              },
+            ],
+          },
+        }),
+      }
+    }
+
+    const specs = await getVehicleTireSpecs('1234567')
+
+    assert.deepEqual(specs.approvedSizes.map((entry) => entry.size), ['205/60R16'])
+    assert.equal(specs.verified, true, 'a failed badge lookup is not a failed fitment')
+    assert.equal(specs.tirePressure.tpms.equipped, null)
+  })
+
+  it('shares one model-dataset call across two plates of the same model', async () => {
+    stubRegistry({
+      [VEHICLES]: [
+        {
+          mispar_rechev: 1111111,
+          tozeret_cd: 297,
+          degem_cd: 415,
+          tozeret_nm: 'מאזדה יפן',
+          kinuy_mishari: 'MAZDA 3',
+          shnat_yitzur: 2020,
+          zmig_kidmi: '205/60R16',
+        },
+      ],
+      [MODELS]: [{ shnat_yitzur: 2020, hayshaney_lahatz_avir_batzmigim_ind: 1 }],
+    })
+
+    await getVehicleTireSpecs('1111111')
+    await getVehicleTireSpecs('2222222')
+
+    const modelCalls = calls.filter((call) => call.resourceId === MODELS)
+    assert.equal(modelCalls.length, 1, 'the model cache should absorb the second lookup')
   })
 
   it('strips the country-of-origin suffix from the manufacturer name', async () => {

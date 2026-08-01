@@ -34,7 +34,42 @@ const ApprovedSizeSchema = new Schema(
     speedRating: { type: String, maxlength: 3, uppercase: true },
     /** Factory-fitted size. Surfaced first in the UI as the safe default. */
     isOem: { type: Boolean, default: false },
-    recommendedPressureBar: { type: Number, min: 1.5, max: 5 },
+    /**
+     * No per-size pressure field here on purpose. The Ministry of Transport
+     * publishes tire *sizes* and a TPMS flag, and nothing else about inflation
+     * — see `lib/tirePressure.js` for the field-level survey. A column that can
+     * only ever hold a guess is worse than no column, because the next person
+     * to read this schema will assume it holds a manufacturer figure.
+     */
+  },
+  { _id: false },
+)
+
+/**
+ * What we can honestly say about inflation pressure.
+ *
+ * Split in two because the halves have different provenance and must not be
+ * rendered with the same authority: `tpms` is registry data about this model,
+ * `guidance` is a class-typical range that is true of most vehicles and
+ * specific to none.
+ */
+const TirePressureSchema = new Schema(
+  {
+    tpms: {
+      /** `null` when the model rows are absent or disagree across trims. */
+      equipped: { type: Boolean, default: null },
+      source: { type: String, enum: ['ministry_of_transport'], default: 'ministry_of_transport' },
+    },
+    guidance: {
+      barMin: { type: Number, min: 1.5, max: 5 },
+      barMax: { type: Number, min: 1.5, max: 5 },
+      psiMin: { type: Number, min: 20, max: 75 },
+      psiMax: { type: Number, min: 20, max: 75 },
+      vehicleClass: { type: String },
+      /** Always false. Persisted so a stale document cannot lose the caveat. */
+      vehicleSpecific: { type: Boolean, default: false },
+      source: { type: String, enum: ['general_guidance'], default: 'general_guidance' },
+    },
   },
   { _id: false },
 )
@@ -77,11 +112,25 @@ const VehicleTireSpecsSchema = new Schema(
         message: 'A vehicle must have at least one approved size',
       },
     },
+    tirePressure: { type: TirePressureSchema },
     source: {
       type: String,
-      enum: ['ministry_of_transport', 'manufacturer', 'manual'],
+      /**
+       * `fallback_reference` is what the aggregator emits when the registry
+       * knows the vehicle but carries no sizes for it. Omitting it here would
+       * make every fallback result fail validation on write — silently, since a
+       * cache write is deliberately not allowed to fail the request.
+       */
+      enum: ['ministry_of_transport', 'fallback_reference', 'manufacturer', 'manual'],
       required: true,
     },
+    /**
+     * False when the sizes came from the reference table rather than the
+     * registry. Persisted because the UI's disclaimer keys off it, and a
+     * cached document that lost the flag would present unverified sizes with
+     * full authority.
+     */
+    verified: { type: Boolean, default: true },
     fetchedAt: { type: Date, required: true, default: Date.now },
     /**
      * Cache expiry. The registry is authoritative and changes when a vehicle is

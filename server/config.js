@@ -12,8 +12,57 @@ function num(value, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback
 }
 
+function bool(value, fallback) {
+  if (value === undefined) return fallback
+  return value !== 'false' && value !== '0'
+}
+
 export const config = {
+  /** Render (and every other PaaS) injects the port it wants us on. */
   port: num(process.env.PORT, 4000),
+
+  /**
+   * Behind Render's load balancer every request arrives from the proxy, so
+   * `req.ip` is the proxy's address unless Express is told to read
+   * `X-Forwarded-For`. Without this the per-IP rate limit throttles the whole
+   * internet as if it were one visitor — the first real request would lock
+   * everyone out for a minute.
+   *
+   * Exactly one hop, not `true`: trusting the entire chain lets a client forge
+   * `X-Forwarded-For` and reset its own limit at will.
+   */
+  trustProxy: num(process.env.TRUST_PROXY, 1),
+
+  /**
+   * Serve the Vite build from this process.
+   *
+   * Vite's dev proxy does not exist in a production build, so a separately
+   * hosted static site has no way to reach `/api`. Serving both from one origin
+   * removes that problem and CORS along with it.
+   */
+  serveStatic: bool(process.env.SERVE_STATIC, true),
+  staticDir: process.env.STATIC_DIR ?? 'dist',
+
+  /**
+   * Shared secret for `/api/diagnostics/registry`.
+   *
+   * The endpoint reports internal CKAN resource ids and dataset column names —
+   * useful on a bad day, not something to publish. Unset means the endpoint is
+   * disabled outright rather than open, so forgetting to configure it fails
+   * closed.
+   */
+  diagnosticsToken: process.env.DIAGNOSTICS_TOKEN ?? '',
+
+  /**
+   * Persistent fitment cache.
+   *
+   * Off by default: `mongoose` is not a dependency of this service yet, so the
+   * in-process cache is the only layer. Enabling this without installing it
+   * would take the whole service down at boot, hence the explicit opt-in.
+   */
+  persistence: {
+    enabled: bool(process.env.ENABLE_MONGO_CACHE, false),
+  },
   mongoUri: process.env.MONGO_URI ?? 'mongodb://127.0.0.1:27017/supertzamig',
 
   gov: {
@@ -57,6 +106,30 @@ export const config = {
      */
     timeoutMs: num(process.env.GOV_API_TIMEOUT_MS, 6000),
     maxRetries: num(process.env.GOV_API_MAX_RETRIES, 2),
+
+    /**
+     * Model-dataset enrichment (currently the TPMS flag).
+     *
+     * The vehicle row usually carries the tire sizes, so the fitment lookup can
+     * finish in one call. Enrichment lives only in the model dataset, so
+     * fetching it costs a second call on the otherwise-fast path — but only
+     * once per model, since the result is cached by model rather than by plate
+     * and the Israeli fleet is concentrated in relatively few models.
+     *
+     * Budgeted tightly and allowed to fail: it is a nice-to-have badge, and it
+     * must never delay or break a lookup that can already answer the question
+     * the customer actually asked.
+     */
+    enrichModelData: process.env.GOV_ENRICH_MODEL_DATA !== 'false',
+    /**
+     * Deliberately tight. Observed successful model queries return in ~400ms,
+     * so this clears the normal case with room to spare while capping what a
+     * hung enrichment can add to a lookup that is already answerable. A badge
+     * is not worth another second of the customer watching a spinner.
+     */
+    enrichTimeoutMs: num(process.env.GOV_ENRICH_TIMEOUT_MS, 1500),
+    /** Distinct models held in the shared enrichment cache. */
+    enrichCacheEntries: num(process.env.GOV_ENRICH_CACHE_ENTRIES, 1000),
     /** Consecutive failures before the breaker opens. */
     circuitThreshold: num(process.env.GOV_API_CIRCUIT_THRESHOLD, 5),
     circuitResetMs: num(process.env.GOV_API_CIRCUIT_RESET_MS, 30_000),

@@ -25,6 +25,11 @@ const RATE_LIMIT = { windowMs: 60_000, max: 20 }
 const hits = new Map()
 
 function rateLimit(req, res, next) {
+  /**
+   * Requires `trust proxy` to be set on the app. Behind a load balancer without
+   * it, every request shares the proxy's address and the first visitor to hit
+   * the limit locks out everyone else.
+   */
   const key = req.ip
   const now = Date.now()
   const entry = hits.get(key)
@@ -66,7 +71,7 @@ vehicleRouter.get('/:plate/tire-specs', rateLimit, async (req, res, next) => {
     const specs = await getVehicleTireSpecs(req.params.plate, {
       store: vehicleSpecsStore,
       signal: controller.signal,
-      log: (event) => req.log?.info?.(event),
+      log: (event) => req.log?.(event),
     })
 
     // Private: the response is keyed to one person's vehicle, so it may sit in
@@ -90,8 +95,9 @@ export function vehicleErrorHandler(error, req, res, next) {
 
   if (error instanceof ServiceError) {
     if (error.status >= 500) {
-      req.log?.error?.({
+      req.log?.({
         event: 'fitment.failed',
+        level: 'error',
         code: error.code,
         plate: req.params?.plate ? plateFingerprint(req.params.plate) : undefined,
         cause: error.cause?.message,
@@ -100,7 +106,12 @@ export function vehicleErrorHandler(error, req, res, next) {
     return res.status(error.status).json(error.toResponse())
   }
 
-  req.log?.error?.({ event: 'fitment.crashed', message: error.message, stack: error.stack })
+  req.log?.({
+    event: 'fitment.crashed',
+    level: 'error',
+    message: error.message,
+    stack: error.stack,
+  })
   return res.status(500).json({
     error: { message: 'אירעה תקלה בשרת. הצוות שלנו כבר בדרך לתקן.', code: 'internal_error' },
   })

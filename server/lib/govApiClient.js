@@ -83,9 +83,22 @@ export function __resetBreaker() {
  * @param {object} [params.filters] Exact-match field filters.
  * @param {number} [params.limit]
  * @param {AbortSignal} [params.signal] Caller cancellation, e.g. client hang-up.
+ * @param {number} [params.timeoutMs] Override the default per-attempt timeout.
+ *   Used by non-essential enrichment lookups, which must not be allowed to
+ *   spend the whole latency budget of a request that can succeed without them.
+ * @param {number} [params.maxRetries] Override the default retry count, for the
+ *   same reason.
  * @returns {Promise<Array<object>>} Matching records, possibly empty.
  */
-export async function searchDatastore({ resourceId, filters = {}, limit = 10, signal, log = () => {} }) {
+export async function searchDatastore({
+  resourceId,
+  filters = {},
+  limit = 10,
+  signal,
+  timeoutMs = config.gov.timeoutMs,
+  maxRetries = config.gov.maxRetries,
+  log = () => {},
+}) {
   if (breaker.isOpen) {
     log({ event: 'gov.short_circuited', resourceId })
     throw errors.registryUnavailable(new Error('circuit_open'))
@@ -101,14 +114,14 @@ export async function searchDatastore({ resourceId, filters = {}, limit = 10, si
   let lastError = null
   let lastStatus = 0
 
-  for (let attempt = 0; attempt <= config.gov.maxRetries; attempt += 1) {
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     const startedAt = Date.now()
     /**
      * Two independent reasons to abort: our own timeout, and the caller giving
      * up. `AbortSignal.any` collapses them so a client disconnect stops the
      * outbound call instead of leaving it running against a dead response.
      */
-    const timeout = AbortSignal.timeout(config.gov.timeoutMs)
+    const timeout = AbortSignal.timeout(timeoutMs)
     const composite = signal ? AbortSignal.any([timeout, signal]) : timeout
 
     try {
@@ -161,7 +174,7 @@ export async function searchDatastore({ resourceId, filters = {}, limit = 10, si
       lastError = error
     }
 
-    if (attempt < config.gov.maxRetries) {
+    if (attempt < maxRetries) {
       // Exponential backoff with jitter, so a fleet of dynos recovering from an
       // outage does not resynchronize into a thundering herd.
       const backoff = 200 * 2 ** attempt

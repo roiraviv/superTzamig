@@ -3,6 +3,7 @@ import { config } from '../config.js'
 import { errors } from '../lib/errors.js'
 import { searchDatastore } from '../lib/govApiClient.js'
 import { mergeApprovedSizes, toApprovedSizes } from '../lib/tireSize.js'
+import { buildTirePressure } from '../lib/tirePressure.js'
 import { fallbackFitmentForVehicle, shouldFallBack } from './fallbackService.js'
 
 /**
@@ -19,6 +20,11 @@ import { fallbackFitmentForVehicle, shouldFallBack } from './fallbackService.js'
  * has both tire fields populated we return on one network call instead of two.
  * That is the difference between a fast lookup and a slow one for a large share
  * of traffic, and the government API is the entire latency budget here.
+ *
+ * The model dataset also carries attributes the vehicle row does not — right
+ * now the TPMS flag. Those are fetched as *enrichment*: same query, tight
+ * budget, failures swallowed, and the rows are kept out of the size
+ * calculation. See `getVehicleTireSpecs`.
  */
 
 /* ------------------------------- Field names ------------------------------ */
@@ -149,20 +155,36 @@ async function fetchVehicleRecord(plate, { signal, log } = {}) {
  *
  * Returns every matching row. One model code spans trims and production years
  * with different fitments, and the caller merges them.
+ *
+ * Cached by model, not by plate. Two customers with the same car share the
+ * entry, which is what makes the enrichment call affordable: the fleet is
+ * concentrated in few models, so after warmup most lookups pay nothing for it.
  */
-async function fetchModelRecords({ manufacturerCode, modelCode, year }, { signal, log } = {}) {
+async function fetchModelRecords(
+  { manufacturerCode, modelCode, year },
+  { signal, log, timeoutMs, maxRetries } = {},
+) {
   if (manufacturerCode == null || modelCode == null) return []
 
-  const records = await searchDatastore({
-    resourceId: config.gov.resources.models,
-    filters: {
-      [FIELDS.manufacturerCode]: manufacturerCode,
-      [FIELDS.modelCode]: modelCode,
-    },
-    limit: 50,
-    signal,
-    log,
-  })
+  const cacheKey = `${manufacturerCode}:${modelCode}`
+  let records = modelCache.get(cacheKey)
+
+  if (!records) {
+    records = await searchDatastore({
+      resourceId: config.gov.resources.models,
+      filters: {
+        [FIELDS.manufacturerCode]: manufacturerCode,
+        [FIELDS.modelCode]: modelCode,
+      },
+      limit: 50,
+      signal,
+      timeoutMs,
+      maxRetries,
+      log,
+    })
+    // Cached unfiltered so every production year of the model shares one entry.
+    modelCache.set(cacheKey, records, config.cache.ttlDays * 24 * 60 * 60 * 1000)
+  }
 
   if (records.length === 0) return []
 
@@ -180,7 +202,21 @@ async function fetchModelRecords({ manufacturerCode, modelCode, year }, { signal
  * Exported for tests, which drive it with fixture records rather than the live
  * registry.
  */
-export function buildFitment({ plate, vehicleRecord, modelRecords, fallbackReason }) {
+export function buildFitment({
+  plate,
+  vehicleRecord,
+  modelRecords = [],
+  /**
+   * Model rows fetched purely to read attributes off, when the sizes were
+   * already answered by the vehicle row.
+   *
+   * Kept as a separate argument rather than merged into `modelRecords` so that
+   * turning enrichment on can never change which tire sizes we call legal. A
+   * badge is not worth a new way to produce a wrong fitment.
+   */
+  enrichmentRecords = [],
+  fallbackReason,
+}) {
   const year = toInt(vehicleRecord[FIELDS.year])
   const totalWeightKg = toInt(vehicleRecord[FIELDS.totalWeight])
 
@@ -225,11 +261,23 @@ export function buildFitment({ plate, vehicleRecord, modelRecords, fallbackReaso
     ...(totalWeightKg ? { curbWeightKg: totalWeightKg } : {}),
   }
 
+  /**
+   * Pressure reads from whichever model rows we happen to hold. The registry
+   * publishes no recommended pressure at all, so this is a TPMS fact plus a
+   * class-typical range — see `lib/tirePressure.js`.
+   */
+  const pressureRecords = modelRecords.length > 0 ? modelRecords : enrichmentRecords
+  const tirePressure = buildTirePressure({
+    vehicleClass: vehicle.vehicleClass,
+    modelRecords: pressureRecords,
+  })
+
   if (approvedSizes.length > 0) {
     return {
       licensePlate: plate,
       vehicle,
       approvedSizes,
+      tirePressure,
       source: 'ministry_of_transport',
       verified: true,
       fetchedAt: new Date().toISOString(),
@@ -246,13 +294,25 @@ export function buildFitment({ plate, vehicleRecord, modelRecords, fallbackReaso
   })
   if (!fallback) throw errors.tireSpecsUnavailable()
 
+  const fallbackClass = fallback.vehicleClass ?? vehicle.vehicleClass
+
   return {
     licensePlate: plate,
     vehicle: {
       ...vehicle,
-      vehicleClass: fallback.vehicleClass ?? vehicle.vehicleClass,
+      vehicleClass: fallbackClass,
     },
     approvedSizes: fallback.approvedSizes,
+    /**
+     * Rebuilt rather than reused: the reference table may classify the vehicle
+     * differently from the registry heuristic, and the guidance range is keyed
+     * on that class. The TPMS flag itself stays valid either way — it came from
+     * the registry and describes the vehicle, not the sizes we fell back on.
+     */
+    tirePressure: buildTirePressure({
+      vehicleClass: fallbackClass,
+      modelRecords: pressureRecords,
+    }),
     source: fallback.source,
     verified: false,
     fallbackReason: fallback.reason,
@@ -272,6 +332,11 @@ export function buildFitment({ plate, vehicleRecord, modelRecords, fallbackReaso
  */
 class MemoryCache {
   #entries = new Map()
+  #maxEntries
+
+  constructor(maxEntries) {
+    this.#maxEntries = maxEntries
+  }
 
   get(key) {
     const entry = this.#entries.get(key)
@@ -284,7 +349,7 @@ class MemoryCache {
   }
 
   set(key, value, ttlMs) {
-    if (this.#entries.size >= config.cache.memoryEntries) {
+    if (this.#entries.size >= this.#maxEntries) {
       this.#entries.delete(this.#entries.keys().next().value)
     }
     this.#entries.set(key, { value, expiresAt: Date.now() + ttlMs })
@@ -295,7 +360,17 @@ class MemoryCache {
   }
 }
 
-const memoryCache = new MemoryCache()
+/** Fitment results, keyed by plate. */
+const memoryCache = new MemoryCache(config.cache.memoryEntries)
+
+/**
+ * Model dataset rows, keyed by manufacturer + model code.
+ *
+ * Separate from the plate cache and much denser in value: one entry serves
+ * every customer driving that model, which is what keeps the enrichment call
+ * off the critical path in practice.
+ */
+const modelCache = new MemoryCache(config.gov.enrichCacheEntries)
 
 /**
  * Requests for the same plate that arrive while a lookup is in flight.
@@ -363,19 +438,19 @@ export async function getVehicleTireSpecs(rawPlate, { store, signal, log = () =>
         rear: vehicleRecord[FIELDS.rearTire],
       }).length > 0
 
+    const modelKey = {
+      manufacturerCode: toInt(vehicleRecord[FIELDS.manufacturerCode]),
+      modelCode: toInt(vehicleRecord[FIELDS.modelCode]),
+      year: toInt(vehicleRecord[FIELDS.year]),
+    }
+
     let modelRecords = []
+    let enrichmentRecords = []
     let registryFailure = null
 
     if (!vehicleHasSizes) {
       try {
-        modelRecords = await fetchModelRecords(
-          {
-            manufacturerCode: toInt(vehicleRecord[FIELDS.manufacturerCode]),
-            modelCode: toInt(vehicleRecord[FIELDS.modelCode]),
-            year: toInt(vehicleRecord[FIELDS.year]),
-          },
-          { signal, log },
-        )
+        modelRecords = await fetchModelRecords(modelKey, { signal, log })
       } catch (error) {
         // Step 2 is the one the fallback can cover: we already know the vehicle,
         // so a reference lookup by model is an honest substitute for the sizes.
@@ -383,12 +458,31 @@ export async function getVehicleTireSpecs(rawPlate, { store, signal, log = () =>
         registryFailure = error
         log({ event: 'fitment.step2_failed', plate: fingerprint, code: error.code })
       }
+    } else if (config.gov.enrichModelData) {
+      /**
+       * Sizes are already answered, so this call buys attributes only. It runs
+       * on a short budget with no retries and every failure swallowed: the
+       * customer asked which tires fit their car, and they get that answer
+       * whether or not we can also tell them the car has a TPMS.
+       */
+      try {
+        enrichmentRecords = await fetchModelRecords(modelKey, {
+          signal,
+          log,
+          timeoutMs: config.gov.enrichTimeoutMs,
+          maxRetries: 0,
+        })
+      } catch (error) {
+        if (signal?.aborted) throw error
+        log({ event: 'fitment.enrich_failed', plate: fingerprint, code: error.code })
+      }
     }
 
     const fitment = buildFitment({
       plate,
       vehicleRecord,
       modelRecords,
+      enrichmentRecords,
       fallbackReason: registryFailure?.code ?? 'registry_missing_sizes',
     })
 
@@ -399,6 +493,7 @@ export async function getVehicleTireSpecs(rawPlate, { store, signal, log = () =>
       source: fitment.source,
       verified: fitment.verified,
       sizes: fitment.approvedSizes.length,
+      tpms: fitment.tirePressure?.tpms?.equipped ?? null,
       durationMs: Date.now() - startedAt,
     })
 
@@ -425,5 +520,6 @@ export async function getVehicleTireSpecs(rawPlate, { store, signal, log = () =>
 /** Test seam. */
 export function __clearCaches() {
   memoryCache.clear()
+  modelCache.clear()
   inFlight.clear()
 }
